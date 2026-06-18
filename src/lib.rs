@@ -486,14 +486,13 @@ mod tests {
     #[test]
     fn test_no_cargo_build_in_source() {
         // AC3: assert no local cargo invocation in src/.
-        // We check that Command::new("cargo") — the functional pattern for
-        // spawning a local cargo subprocess — does not appear. We deliberately
-        // avoid putting the forbidden literal string in this test's body to
-        // avoid false-positives when the test itself is scanned.
+        // We check that the subprocess-spawn pattern for the cargo binary
+        // does not appear in any source file. The forbidden string is
+        // constructed at runtime so this comment does not trigger the check.
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        // Forbidden functional pattern: Command::new("cargo")
-        // Encoded split to avoid the test itself matching.
-        let forbidden_spawn = format!("Command::new({})", "\"cargo\"");
+        // Build the forbidden pattern at runtime to avoid self-matching.
+        let cargo_name = "cargo";
+        let forbidden_spawn = format!("Command::new(\"{cargo_name}\")");
         for entry in std::fs::read_dir(&src_dir).expect("read src/") {
             let entry = entry.expect("entry");
             let path = entry.path();

@@ -5,9 +5,9 @@
 use std::path::Path;
 
 fn scan_for_forbidden_patterns(src_dir: &Path) {
-    // Forbidden functional pattern: Command::new("cargo") — the actual way to
-    // spawn a cargo subprocess in Rust. We build it at runtime to avoid
-    // this test itself matching when src/ is scanned.
+    // Build the forbidden pattern at runtime so this test file cannot
+    // self-match when src/ is scanned. The pattern is the subprocess-spawn
+    // invocation for the cargo binary.
     let forbidden_spawn = format!("Command::new({})", "\"cargo\"");
 
     let walker = std::fs::read_dir(src_dir).expect("read src/");
