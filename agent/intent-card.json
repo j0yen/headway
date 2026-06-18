@@ -1,0 +1,116 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-headway-build.md",
+  "root_motivation": "Enforce the cloudbuild-only rule in a single canonical primitive that all crate-rebuild consumers (rollout, agorabus freshness loop, headway-verify) can delegate to, instead of re-litigating the rule per caller and risking local cargo invocations.",
+  "user_persona": "Joe Yen, on wintermute laptop, running automated rebuild loops (rollout, agorabus reload --build, headway-verify) that need to recompile Rust crates via Hetzner cloudbuild, never locally.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing_count",
+    "lower_is_better": false,
+    "harness_command": "bash scripts/run-metrics.sh",
+    "target": 7
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "headway build <crate-dir> --dry-run --format json prints a BuildPlan plus the exact cloudbuild.sh build <name> command line that would run, mutates nothing, and exits 0. Default posture is dry-run.",
+      "test": "tests/acceptance_ac1.rs"
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "With --no-dry-run (apply), build invokes cloudbuild.sh build <name> as a subprocess and returns a BuildVerdict whose cloudbuild_status reflects the subprocess outcome. Tested with a stub cloudbuild script via HEADWAY_CLOUDBUILD pointing at a fixture.",
+      "test": "tests/acceptance_ac2.rs"
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "There is no code path that runs cargo build/cargo install locally. A grep in the test suite asserts the crate contains no local-cargo invocation in the build path; the only compiler invocation is via the cloudbuild subprocess.",
+      "test": "tests/acceptance_ac3.rs"
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "When the configured cloudbuild script is absent or exits with the unreachable code, build returns status: cloudbuild-unreachable, emits a structured error to stderr, and exits non-zero — never silently builds local.",
+      "test": "tests/acceptance_ac4.rs"
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "When installed_version == source_head (already fresh), build returns status: no-op-fresh without invoking cloudbuild, unless --no-require-fresh is passed.",
+      "test": "tests/acceptance_ac5.rs"
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "BuildVerdict records version_before and version_after; on a successful build against a fixture they differ, on a no-op they are equal.",
+      "test": "tests/acceptance_ac6.rs"
+    },
+    {
+      "id": "AC7",
+      "level": "MUST",
+      "description": "headway --version and headway build --help work on the freshly-built binary; cargo test is green and clippy produces no new warnings over the repo baseline.",
+      "test": "tests/acceptance_ac7.rs"
+    }
+  ],
+  "scope": [
+    "CLI binary: headway build <crate-dir> [--dry-run] [--no-dry-run] [--format json|table] [--no-require-fresh]",
+    "Library: build(plan, cfg) -> BuildVerdict that shells out to cloudbuild.sh",
+    "BuildPlan struct: crate_dir, crate_name, source_head, installed_version",
+    "BuildVerdict struct: crate_name, artifact_path, version_before, version_after, cloudbuild_status, elapsed_ms, status",
+    "Status enum: built | no-op-fresh | cloudbuild-unreachable | build-failed",
+    "HEADWAY_CLOUDBUILD env var to override cloudbuild.sh path",
+    "Hard guard: no local cargo code path, ever"
+  ],
+  "non_goals": [
+    "Does not implement cloudbuild.sh itself — only wraps it as a subprocess",
+    "Does not manage Hetzner server lifecycle (up/down) — that is cloudbuild.sh's domain",
+    "Does not build multiple crates in parallel (fleet mode) — that is a headway-fleet follow-on PRD",
+    "Does not cache or deduplicate builds beyond the no-op-fresh freshness check",
+    "Does not fall back to local cargo under any circumstance — cloudbuild-unreachable is always the fallback status"
+  ],
+  "hard_constraints": {
+    "rust_edition": "2021",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 8,
+    "msrv": "1.85",
+    "additional": {
+      "sigpipe_reset": "sigpipe::reset() must be the first line of main() per standing SIGPIPE-panic lesson"
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why does headway need to exist at all?",
+      "a": "rollout/src/fleet.rs:71 hardcodes 'cargo build --release' as the default build_cmd — a local compile — violating the standing cloudbuild-only rule."
+    },
+    {
+      "why": 2,
+      "q": "Why can't each caller just call cloudbuild.sh directly?",
+      "a": "The cloudbuild path was intended but never wired: rollout/src/warmswap.rs:630 has an ignored placeholder test with 'Run manually with:…'. Without a canonical primitive, every caller re-litigates and often misses the wiring."
+    },
+    {
+      "why": 3,
+      "q": "Why is the missing wiring a blocker right now?",
+      "a": "The recurring self-review item 'agorabus 3d behind source; needs cloudbuild + reload --apply' is unactionable because no callable primitive wraps the cloudbuild build step for the freshness loop."
+    },
+    {
+      "why": 4,
+      "q": "Why not just fix rollout in place rather than adding a new crate?",
+      "a": "A point-fix to rollout enforces the rule in one caller only; a shared primitive enforces it everywhere in one place and makes cloudbuild-unreachable the hard-coded fallback rather than an afterthought."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "What rust_edition to use — PRD says MSRV 1.85 but doesn't name edition?",
+      "resolution": "Using edition 2021 (compatible with MSRV 1.85; edition 2024 requires rustc 1.85+ but let_chains not needed here)."
+    },
+    {
+      "question": "Does --dry-run default mean the CLI argument needs to be explicit or is it the absence of --no-dry-run?",
+      "resolution": "Default posture is dry-run; --no-dry-run flag enables apply mode. Matches agorabus reload --require-fresh precedent described in PRD."
+    }
+  ],
+  "created_at": "2026-06-18T00:00:00Z",
+  "intent_slug": "headway-build"
+}
