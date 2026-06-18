@@ -209,15 +209,11 @@ pub fn plan(crate_dir: &Path, cfg: &BuildConfig) -> Result<BuildPlan> {
 pub fn build(build_plan: &BuildPlan, cfg: &BuildConfig) -> Result<BuildVerdict> {
     let version_before = build_plan.installed_version.clone();
 
-    // No-op-fresh guard
-    if cfg.require_fresh {
+    // No-op-fresh guard: if the installed version equals the source HEAD,
+    // there is nothing to rebuild. Skip if source_head is "unknown" (no git repo).
+    if cfg.require_fresh && build_plan.source_head != "unknown" {
         if let Some(ref installed) = build_plan.installed_version {
-            if installed.contains(&build_plan.source_head)
-                || build_plan.source_head == "unknown"
-            {
-                // source_head is "unknown" only if not a git repo; treat
-                // as potentially fresh to avoid spurious builds.
-            } else if *installed == build_plan.source_head {
+            if installed.as_str() == build_plan.source_head.as_str() {
                 return Ok(BuildVerdict {
                     crate_name: build_plan.crate_name.clone(),
                     artifact_path: None,
