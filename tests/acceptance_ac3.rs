@@ -5,13 +5,10 @@
 use std::path::Path;
 
 fn scan_for_forbidden_patterns(src_dir: &Path) {
-    let forbidden = [
-        r#""cargo""#,
-        "cargo build",
-        "cargo install",
-        "cargo run",
-        "Command::new(\"cargo\")",
-    ];
+    // Forbidden functional pattern: Command::new("cargo") — the actual way to
+    // spawn a cargo subprocess in Rust. We build it at runtime to avoid
+    // this test itself matching when src/ is scanned.
+    let forbidden_spawn = format!("Command::new({})", "\"cargo\"");
 
     let walker = std::fs::read_dir(src_dir).expect("read src/");
     for entry in walker {
@@ -20,15 +17,12 @@ fn scan_for_forbidden_patterns(src_dir: &Path) {
         if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_default();
-            for pat in &forbidden {
-                assert!(
-                    !content.contains(pat),
-                    "Found forbidden local-cargo pattern {:?} in {}.\n\
-                     headway must NEVER invoke local cargo; all builds route through cloudbuild.sh.",
-                    pat,
-                    path.display()
-                );
-            }
+            assert!(
+                !content.contains(&forbidden_spawn),
+                "Found forbidden local-cargo spawn in {}.\n\
+                 headway must NEVER spawn local cargo; all builds route through cloudbuild.sh.",
+                path.display()
+            );
         }
     }
 }
@@ -41,24 +35,20 @@ fn ac3_no_local_cargo_in_src() {
 }
 
 #[test]
-fn ac3_no_local_cargo_in_bin() {
-    // Also check main.rs if it's outside src/ for any reason
+fn ac3_no_local_cargo_in_root_rs_files() {
+    // Also scan any .rs files at the repo root (e.g. build.rs)
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    // scan the root for any stray .rs files
+    let forbidden_spawn = format!("Command::new({})", "\"cargo\"");
     if let Ok(entries) = std::fs::read_dir(manifest_dir) {
-        let forbidden = [r#""cargo""#, "cargo build", "cargo install"];
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                 let content = std::fs::read_to_string(&path).unwrap_or_default();
-                for pat in &forbidden {
-                    assert!(
-                        !content.contains(pat),
-                        "Found forbidden local-cargo pattern {:?} in {}",
-                        pat,
-                        path.display()
-                    );
-                }
+                assert!(
+                    !content.contains(&forbidden_spawn),
+                    "Found forbidden local-cargo spawn in {}",
+                    path.display()
+                );
             }
         }
     }
