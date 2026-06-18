@@ -1,7 +1,9 @@
 //! `headway` — sanctioned cloudbuild-only build primitive.
 //!
 //! Routes all Rust crate recompiles through `cloudbuild.sh` (Hetzner),
-//! never local `cargo`. The single entry point is [`build`].
+//! never local `cargo`. The core build entry point is [`build`]; the
+//! verification entry point is [`verify`]; the composed end-to-end
+//! command is [`run`].
 
 #![deny(unsafe_code)]
 #![warn(missing_docs, unreachable_pub)]
@@ -370,6 +372,331 @@ pub fn format_verdict_table(verdict: &BuildVerdict) -> String {
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// verify — post-install daemon freshness check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The binstale verdict for a running process.
+///
+/// Maps to the subset of `binstale check --format json` output that headway
+/// cares about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BinstaleVerdict {
+    /// Binary on disk matches the running process — daemon is current.
+    Fresh,
+    /// Binary was deleted from disk; daemon is running from a deleted exe.
+    DeletedExe,
+    /// Inode of the on-disk binary has drifted since the daemon started.
+    InodeDrift,
+    /// Provenance-stamp is stale relative to the newest source commit.
+    ProvStale,
+    /// Build timestamp is behind the newest source commit.
+    BehindHead,
+    /// binstale could not determine the verdict (missing /proc, unknown error).
+    Unknown,
+}
+
+impl std::fmt::Display for BinstaleVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Fresh => "fresh",
+            Self::DeletedExe => "deleted-exe",
+            Self::InodeDrift => "inode-drift",
+            Self::ProvStale => "prov-stale",
+            Self::BehindHead => "behind-head",
+            Self::Unknown => "unknown",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Outcome of a [`verify`] call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VerifyOutcome {
+    /// `binstale` returned `fresh` — the daemon advanced successfully.
+    Confirmed,
+    /// `binstale` returned `behind-head` (or another non-fresh staleness)
+    /// — the remediation did not take. Never silently downgraded to confirmed.
+    Contradicted,
+    /// `binstale` returned `unknown` or was unreachable.
+    Inconclusive,
+}
+
+impl std::fmt::Display for VerifyOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Confirmed => "confirmed",
+            Self::Contradicted => "contradicted",
+            Self::Inconclusive => "inconclusive",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Receipt produced by [`verify`].
+///
+/// Emitted as JSON via `headway verify --format json`. Suitable for
+/// self-review or docket consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyReceipt {
+    /// Daemon name / binary name passed to `verify`.
+    pub daemon: String,
+    /// PID probed before the reload (0 if not discoverable).
+    pub pid_before: u32,
+    /// PID probed after the reload (0 if not discoverable).
+    pub pid_after: u32,
+    /// binstale verdict before the reload.
+    pub verdict_before: BinstaleVerdict,
+    /// binstale verdict after the reload.
+    pub verdict_after: BinstaleVerdict,
+    /// High-level outcome.
+    pub outcome: VerifyOutcome,
+    /// ISO-8601 timestamp (UTC) when verify ran.
+    pub ts: String,
+}
+
+/// Configuration for [`verify`].
+#[derive(Debug, Clone)]
+pub struct VerifyConfig {
+    /// Path to the `binstale` binary. Overridden by `HEADWAY_BINSTALE` env var.
+    pub binstale_path: PathBuf,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            binstale_path: resolve_binstale_path(),
+        }
+    }
+}
+
+/// Resolve `HEADWAY_BINSTALE` → `binstale` on `$PATH`.
+#[must_use]
+pub fn resolve_binstale_path() -> PathBuf {
+    std::env::var("HEADWAY_BINSTALE")
+        .map_or_else(|_| PathBuf::from("binstale"), |s| expand_tilde(&s))
+}
+
+/// Probe the PID of a running daemon by name using `pgrep -n`.
+///
+/// Returns `0` when not found or on error.
+/// Public alias for use by the CLI binary.
+#[must_use]
+pub fn probe_pid_pub(daemon: &str) -> u32 {
+    probe_pid(daemon)
+}
+
+fn probe_pid(daemon: &str) -> u32 {
+    Command::new("pgrep")
+        .arg("-n")
+        .arg(daemon)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Call `binstale check <pid> --format json` and return the verdict string.
+///
+/// Returns `"unknown"` on any error or if the pid is 0.
+fn call_binstale(binstale: &Path, pid: u32) -> BinstaleVerdict {
+    if pid == 0 {
+        return BinstaleVerdict::Unknown;
+    }
+    let out = Command::new(binstale)
+        .args(["check", &pid.to_string(), "--format", "json"])
+        .output();
+    match out {
+        Err(_) => BinstaleVerdict::Unknown,
+        Ok(o) if !o.status.success() => BinstaleVerdict::Unknown,
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            parse_binstale_verdict(&text)
+        }
+    }
+}
+
+/// Parse a binstale JSON verdict from stdout.
+///
+/// Accepts both a bare string and a JSON object with a `"verdict"` field.
+fn parse_binstale_verdict(text: &str) -> BinstaleVerdict {
+    // Try to parse as `{"verdict":"fresh",...}` first.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        let s = v
+            .get("verdict")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        return map_verdict_str(&s);
+    }
+    // Fall back to bare string (e.g. `fresh\n`).
+    map_verdict_str(text.trim())
+}
+
+fn map_verdict_str(s: &str) -> BinstaleVerdict {
+    match s {
+        "fresh" => BinstaleVerdict::Fresh,
+        "deleted-exe" => BinstaleVerdict::DeletedExe,
+        "inode-drift" => BinstaleVerdict::InodeDrift,
+        "prov-stale" => BinstaleVerdict::ProvStale,
+        "behind-head" => BinstaleVerdict::BehindHead,
+        _ => BinstaleVerdict::Unknown,
+    }
+}
+
+/// Current UTC timestamp as ISO-8601, best-effort.
+fn now_ts() -> String {
+    // Use `date -u +%Y-%m-%dT%H:%M:%SZ` rather than pulling in a time crate.
+    Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or_else(|| "unknown".to_owned(), |s| s.trim().to_owned())
+}
+
+/// Re-check a daemon's binstale verdict after a rebuild + install + reload.
+///
+/// Queries `binstale check <pid> --format json` for the (new) daemon PID and
+/// classifies:
+/// - `confirmed` — verdict is now `fresh`
+/// - `contradicted` — verdict is still stale; never swallowed
+/// - `inconclusive` — binstale returned `unknown` (no daemon / unreadable)
+///
+/// Exit-code contract (caller must enforce):
+/// - `confirmed` → 0
+/// - `contradicted` → 1
+/// - `inconclusive` → 2
+#[must_use]
+pub fn verify(
+    daemon: &str,
+    pid_before: u32,
+    verdict_before: BinstaleVerdict,
+    cfg: &VerifyConfig,
+) -> VerifyReceipt {
+    let ts = now_ts();
+    let pid_after = probe_pid(daemon);
+    let verdict_after = call_binstale(&cfg.binstale_path, pid_after);
+
+    let outcome = match &verdict_after {
+        BinstaleVerdict::Fresh => VerifyOutcome::Confirmed,
+        BinstaleVerdict::Unknown => VerifyOutcome::Inconclusive,
+        _ => VerifyOutcome::Contradicted,
+    };
+
+    VerifyReceipt {
+        daemon: daemon.to_owned(),
+        pid_before,
+        pid_after,
+        verdict_before,
+        verdict_after,
+        outcome,
+        ts,
+    }
+}
+
+/// Configuration for a [`run`] call — composes build → install/reload → verify.
+#[derive(Debug, Clone, Default)]
+pub struct RunConfig {
+    /// Config for the build step.
+    pub build: BuildConfig,
+    /// Config for the verify step.
+    pub verify: VerifyConfig,
+    /// systemd service name used for `systemctl --user restart <unit>`.
+    /// When `None`, the daemon is not reloaded via systemctl.
+    pub systemd_unit: Option<String>,
+}
+
+/// Combined receipt from a [`run`] call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunReceipt {
+    /// Result of the build step.
+    pub build: BuildVerdict,
+    /// Result of the verify step (present unless build was not Built).
+    pub verify: Option<VerifyReceipt>,
+}
+
+/// Compose build → install/reload → verify into a single receipt.
+///
+/// Steps:
+/// 1. `plan` + `build` (routes through cloudbuild.sh)
+/// 2. Optional `systemctl --user restart <unit>` if `cfg.systemd_unit` is set
+/// 3. `verify` the daemon is now `fresh`
+///
+/// Returns a [`RunReceipt`] with both sub-receipts. The `verify` field is
+/// `None` when the build step did not produce a new artifact
+/// (`NoOpFresh` or `CloudbuildUnreachable` or `BuildFailed`).
+///
+/// # Errors
+///
+/// Returns an error on unexpected I/O. Build or verify failures are captured
+/// in the receipt rather than propagated.
+pub fn run(crate_dir: &Path, daemon: &str, cfg: &RunConfig) -> Result<RunReceipt> {
+    // Step 1: build
+    let bp = plan(crate_dir, &cfg.build)
+        .with_context(|| format!("failed to plan build for {}", crate_dir.display()))?;
+    let pid_before = probe_pid(daemon);
+    let verdict_before = call_binstale(&cfg.verify.binstale_path, pid_before);
+    let build_verdict = build(&bp, &cfg.build)?;
+
+    // Only proceed to reload + verify if the build actually produced something.
+    let produced = matches!(build_verdict.status, Status::Built);
+    if !produced {
+        return Ok(RunReceipt {
+            build: build_verdict,
+            verify: None,
+        });
+    }
+
+    // Step 2: reload (optional)
+    if let Some(ref unit) = cfg.systemd_unit {
+        let _ = Command::new("systemctl")
+            .args(["--user", "restart", unit])
+            .status();
+    }
+
+    // Step 3: verify
+    let verify_receipt = verify(daemon, pid_before, verdict_before, &cfg.verify);
+
+    Ok(RunReceipt {
+        build: build_verdict,
+        verify: Some(verify_receipt),
+    })
+}
+
+/// Format a [`VerifyReceipt`] for table display.
+#[must_use]
+pub fn format_verify_table(r: &VerifyReceipt) -> String {
+    format!(
+        "daemon:         {}\npid_before:     {}\npid_after:      {}\nverdict_before: {}\nverdict_after:  {}\noutcome:        {}\nts:             {}",
+        r.daemon,
+        r.pid_before,
+        r.pid_after,
+        r.verdict_before,
+        r.verdict_after,
+        r.outcome,
+        r.ts,
+    )
+}
+
+/// Format a [`RunReceipt`] for table display.
+#[must_use]
+pub fn format_run_table(r: &RunReceipt) -> String {
+    let build_part = format_verdict_table(&r.build);
+    let verify_part = r
+        .verify
+        .as_ref()
+        .map(|v| format!("\n---\n{}", format_verify_table(v)))
+        .unwrap_or_default();
+    format!("{build_part}{verify_part}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +828,156 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── verify tests ────────────────────────────────────────────────────────
+
+    /// AC1/AC3: fixture binstale returning `fresh` → outcome=confirmed.
+    #[test]
+    fn test_verify_fresh_verdict_gives_confirmed() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let stub = make_stub_binstale(tmp.path(), 0, r#"{"verdict":"fresh"}"#);
+        let cfg = VerifyConfig { binstale_path: stub };
+        // pid_before=0 (not probed for this unit), pid_after will be probed
+        // but since we override the binary we pass pid=1 to avoid pgrep
+        let receipt = verify_with_pid("testd", 0, BinstaleVerdict::BehindHead, 1, &cfg);
+        assert_eq!(receipt.verdict_after, BinstaleVerdict::Fresh);
+        assert_eq!(receipt.outcome, VerifyOutcome::Confirmed);
+    }
+
+    /// AC2: fixture binstale returning `behind-head` → outcome=contradicted,
+    /// never silently confirmed.
+    #[test]
+    fn test_verify_behind_head_gives_contradicted() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let stub = make_stub_binstale(tmp.path(), 0, r#"{"verdict":"behind-head"}"#);
+        let cfg = VerifyConfig { binstale_path: stub };
+        let receipt = verify_with_pid("testd", 0, BinstaleVerdict::BehindHead, 1, &cfg);
+        assert_eq!(receipt.verdict_after, BinstaleVerdict::BehindHead);
+        assert_eq!(receipt.outcome, VerifyOutcome::Contradicted);
+    }
+
+    /// AC4: binstale returns `unknown` → outcome=inconclusive, never confirmed.
+    #[test]
+    fn test_verify_unknown_gives_inconclusive() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let stub = make_stub_binstale(tmp.path(), 0, r#"{"verdict":"unknown"}"#);
+        let cfg = VerifyConfig { binstale_path: stub };
+        let receipt = verify_with_pid("testd", 0, BinstaleVerdict::Unknown, 1, &cfg);
+        assert_eq!(receipt.outcome, VerifyOutcome::Inconclusive);
+    }
+
+    /// AC4: pid=0 (daemon not found) → outcome=inconclusive.
+    #[test]
+    fn test_verify_pid_zero_gives_inconclusive() {
+        let tmp = TempDir::new().expect("tmpdir");
+        // binstale stub won't be called at all since pid==0
+        let stub = make_stub_binstale(tmp.path(), 0, r#"{"verdict":"fresh"}"#);
+        let cfg = VerifyConfig { binstale_path: stub };
+        // Force pid_after=0 by using a daemon name that pgrep won't find
+        // (we still need to call through the real path; just test parse_binstale_verdict
+        // with pid=0 directly via call_binstale).
+        let verdict = call_binstale(&cfg.binstale_path, 0);
+        assert_eq!(verdict, BinstaleVerdict::Unknown);
+    }
+
+    /// AC6: VerifyReceipt includes pid_before and pid_after.
+    #[test]
+    fn test_verify_receipt_has_pid_before_and_after() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let stub = make_stub_binstale(tmp.path(), 0, r#"{"verdict":"fresh"}"#);
+        let cfg = VerifyConfig { binstale_path: stub };
+        let receipt = verify_with_pid("testd", 42, BinstaleVerdict::BehindHead, 99, &cfg);
+        assert_eq!(receipt.pid_before, 42);
+        assert_eq!(receipt.pid_after, 99);
+    }
+
+    /// AC3: VerifyReceipt JSON roundtrip.
+    #[test]
+    fn test_verify_receipt_json_roundtrip() {
+        let r = VerifyReceipt {
+            daemon: "testd".to_owned(),
+            pid_before: 1,
+            pid_after: 2,
+            verdict_before: BinstaleVerdict::BehindHead,
+            verdict_after: BinstaleVerdict::Fresh,
+            outcome: VerifyOutcome::Confirmed,
+            ts: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        let r2: VerifyReceipt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(r2.daemon, r.daemon);
+        assert_eq!(r2.outcome, r.outcome);
+    }
+
+    /// parse_binstale_verdict handles bare strings.
+    #[test]
+    fn test_parse_binstale_verdict_bare_string() {
+        assert_eq!(parse_binstale_verdict("fresh"), BinstaleVerdict::Fresh);
+        assert_eq!(
+            parse_binstale_verdict("behind-head"),
+            BinstaleVerdict::BehindHead
+        );
+        assert_eq!(
+            parse_binstale_verdict("inode-drift"),
+            BinstaleVerdict::InodeDrift
+        );
+        assert_eq!(
+            parse_binstale_verdict("deleted-exe"),
+            BinstaleVerdict::DeletedExe
+        );
+        assert_eq!(
+            parse_binstale_verdict("prov-stale"),
+            BinstaleVerdict::ProvStale
+        );
+        assert_eq!(parse_binstale_verdict(""), BinstaleVerdict::Unknown);
+    }
+
+    /// parse_binstale_verdict handles JSON with verdict field.
+    #[test]
+    fn test_parse_binstale_verdict_json() {
+        assert_eq!(
+            parse_binstale_verdict(r#"{"verdict":"fresh","pid":123}"#),
+            BinstaleVerdict::Fresh
+        );
+    }
+
+    // ── verify helpers ───────────────────────────────────────────────────────
+
+    /// Like [`verify`] but with an explicit `pid_after` (bypasses pgrep).
+    fn verify_with_pid(
+        daemon: &str,
+        pid_before: u32,
+        verdict_before: BinstaleVerdict,
+        pid_after: u32,
+        cfg: &VerifyConfig,
+    ) -> VerifyReceipt {
+        let ts = now_ts();
+        let verdict_after = call_binstale(&cfg.binstale_path, pid_after);
+        let outcome = match &verdict_after {
+            BinstaleVerdict::Fresh => VerifyOutcome::Confirmed,
+            BinstaleVerdict::Unknown => VerifyOutcome::Inconclusive,
+            _ => VerifyOutcome::Contradicted,
+        };
+        VerifyReceipt {
+            daemon: daemon.to_owned(),
+            pid_before,
+            pid_after,
+            verdict_before,
+            verdict_after,
+            outcome,
+            ts,
+        }
+    }
+
+    fn make_stub_binstale(dir: &Path, exit_code: i32, stdout: &str) -> PathBuf {
+        let script = dir.join("stub_binstale.sh");
+        let content = format!(
+            "#!/usr/bin/env bash\necho '{stdout}'\nexit {exit_code}\n"
+        );
+        std::fs::write(&script, content).expect("write stub");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        script
     }
 }

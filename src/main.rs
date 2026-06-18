@@ -1,6 +1,9 @@
 //! `headway` CLI — sanctioned cloudbuild-only build primitive.
 //!
-//! Usage: `headway build <crate-dir> [--dry-run] [--no-dry-run] [--format json|table]`
+//! Subcommands:
+//! - `headway build <crate-dir> [--dry-run] [--no-dry-run] [--format json|table]`
+//! - `headway verify <daemon> [--format json|table]`
+//! - `headway run <crate-dir> <daemon> [--format json|table] [--unit <svc>]`
 
 #![deny(unsafe_code)]
 #![warn(missing_docs, unreachable_pub)]
@@ -8,7 +11,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use headway::{
-    build, format_plan_table, format_verdict_table, plan, BuildConfig,
+    build, format_plan_table, format_run_table, format_verdict_table, format_verify_table,
+    plan, run, verify, BuildConfig, RunConfig, VerifyConfig, VerifyOutcome,
 };
 
 /// Sanctioned cloudbuild-only build primitive.
@@ -23,6 +27,10 @@ struct Cli {
 enum Commands {
     /// Build a crate via cloudbuild.sh (never local cargo).
     Build(BuildArgs),
+    /// Re-check a daemon's binstale verdict after a rebuild + install + reload.
+    Verify(VerifyArgs),
+    /// Compose build → install/reload → verify into a single receipt.
+    Run(RunArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -49,6 +57,37 @@ struct BuildArgs {
     no_require_fresh: bool,
 }
 
+#[derive(Debug, clap::Args)]
+struct VerifyArgs {
+    /// Name of the daemon to probe (passed to `pgrep -n` to find the PID).
+    daemon: String,
+
+    /// Output format.
+    #[arg(long, default_value = "table")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Path to the crate directory to build.
+    crate_dir: std::path::PathBuf,
+
+    /// Name of the daemon to verify after build + install.
+    daemon: String,
+
+    /// Output format.
+    #[arg(long, default_value = "table")]
+    format: OutputFormat,
+
+    /// systemd user unit name to restart after install (e.g. `wm-brain.service`).
+    #[arg(long)]
+    unit: Option<String>,
+
+    /// Disable the no-op-fresh guard on the build step.
+    #[arg(long)]
+    no_require_fresh: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Json,
@@ -63,6 +102,8 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Build(args) => cmd_build(args),
+        Commands::Verify(args) => cmd_verify(args),
+        Commands::Run(args) => cmd_run(args),
     }
 }
 
@@ -107,6 +148,87 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         }
         OutputFormat::Table => {
             println!("{}", format_verdict_table(&verdict));
+        }
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+fn cmd_verify(args: VerifyArgs) -> Result<()> {
+    let cfg = VerifyConfig {
+        binstale_path: headway::resolve_binstale_path(),
+    };
+
+    // For standalone verify: pid_before is the current pid, verdict_before is unknown
+    // (we have no prior snapshot in this call path).
+    let pid_before = headway::probe_pid_pub(&args.daemon);
+    let receipt = verify(
+        &args.daemon,
+        pid_before,
+        headway::BinstaleVerdict::Unknown,
+        &cfg,
+    );
+
+    let exit_code = match receipt.outcome {
+        VerifyOutcome::Confirmed => 0,
+        VerifyOutcome::Contradicted => 1,
+        VerifyOutcome::Inconclusive => 2,
+    };
+
+    match args.format {
+        OutputFormat::Json => {
+            let j = serde_json::to_string_pretty(&receipt).context("serialize VerifyReceipt")?;
+            println!("{j}");
+        }
+        OutputFormat::Table => {
+            println!("{}", format_verify_table(&receipt));
+        }
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+fn cmd_run(args: RunArgs) -> Result<()> {
+    let cfg = RunConfig {
+        build: BuildConfig {
+            cloudbuild_path: headway::resolve_cloudbuild_path_pub(),
+            require_fresh: !args.no_require_fresh,
+        },
+        verify: VerifyConfig {
+            binstale_path: headway::resolve_binstale_path(),
+        },
+        systemd_unit: args.unit,
+    };
+
+    let receipt = run(&args.crate_dir, &args.daemon, &cfg)?;
+
+    // Exit code driven by verify outcome when present; otherwise by build status.
+    let exit_code = if let Some(ref v) = receipt.verify {
+        match v.outcome {
+            VerifyOutcome::Confirmed => 0,
+            VerifyOutcome::Contradicted => 1,
+            VerifyOutcome::Inconclusive => 2,
+        }
+    } else {
+        match receipt.build.status {
+            headway::Status::Built | headway::Status::NoOpFresh => 0,
+            headway::Status::CloudbuildUnreachable | headway::Status::BuildFailed => 1,
+        }
+    };
+
+    match args.format {
+        OutputFormat::Json => {
+            let j = serde_json::to_string_pretty(&receipt).context("serialize RunReceipt")?;
+            println!("{j}");
+        }
+        OutputFormat::Table => {
+            println!("{}", format_run_table(&receipt));
         }
     }
 
