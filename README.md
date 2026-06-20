@@ -1,48 +1,62 @@
 # headway
 
-The fleet has no reusable primitive that recompiles a crate the *sanctioned*
+`headway` recompiles a crate the sanctioned way — every build routed through `cloudbuild.sh` on the Hetzner builder, never local `cargo` — and returns a structured verdict for build, install-and-reload, and verify.
 
-## Overview
+## Why it exists
 
-The fleet has no reusable primitive that recompiles a crate the *sanctioned*
-way. The only automated rebuild path that exists — `rollout` — builds locally
-with `cargo build --release`, which violates the standing hard rule that all
-cargo routes through cloudbuild. This PRD builds `headway`, a new Rust CLI +
-library whose one job is: given a crate directory, route the build through
-`cloudbuild.sh build <crate>`, pull the artifact, and emit a structured verdict.
-It is the foundation crate the rest of the `headway` fleet extends.
+The fleet has a standing rule: all cargo builds route through cloudbuild, not the local machine. But the rule had no primitive behind it. The one automated rebuild path that existed, `rollout`, called `cargo build --release` locally — which is exactly what the rule forbids. A rule without a tool to enforce it is a rule that gets broken under deadline.
 
-
-## Acceptance
-
-
-1. `headway build <crate-dir> --dry-run --format json` prints a `BuildPlan` plus
-   the exact `cloudbuild.sh build <name>` command line that would run, mutates
-   nothing, and exits 0. (Default posture is dry-run.)
-2. With `--no-dry-run` (apply), `build` invokes `cloudbuild.sh build <name>` as a
-   subprocess and returns a `BuildVerdict` whose `cloudbuild_status` reflects the
-   subprocess outcome. (Tested with a stub cloudbuild script via
-   `HEADWAY_CLOUDBUILD` pointing at a fixture.)
-3. There is no code path that runs `cargo build`/`cargo install` locally. A grep
-   in the test suite asserts the crate contains no local-cargo invocation in the
-   build path; the only compiler invocation is via the cloudbuild subprocess.
-4. When the configured cloudbuild script is absent or exits with the
-   unreachable code, `build` returns `status: cloudbuild-unreachable`, emits a
-   structured error to stderr, and exits non-zero — never silently builds local.
-5. When `installed_version == source_head` (already fresh), `build` returns
-   `status: no-op-fresh` without invoking cloudbuild, unless `--no-require-fresh`
-   is passed (matches the agorabus reload `--require-fresh` precedent).
-6. `BuildVerdict` records `version_before` and `version_after`; on a successful
-   build against a fixture they differ, on a no-op they are equal.
-7. `headway --version` and `headway build --help` work on the freshly-built
-   binary; `cargo test` is green and `clippy` produces no new warnings over the
-   repo baseline.
+`headway` is that tool. Point it at a crate, and it builds on the remote builder, pulls the artifact, and tells you what happened — in a form a script or a person can act on. There is no code path that runs `cargo build` or `cargo install` locally; a test greps the build path to keep it that way.
 
 ## Install
 
 ```sh
+git clone https://github.com/j0yen/headway.git
+cd headway
 cargo install --path .
 ```
+
+Requires `cargo` / `rustc 1.85+`. `headway` shells out to `cloudbuild.sh`; point `HEADWAY_CLOUDBUILD` at the script (or a fixture for testing).
+
+## Quickstart
+
+```sh
+# Show the plan and the exact cloudbuild command — mutates nothing (this is the default)
+headway build ./my-crate --format json
+
+# Actually build on the remote builder
+headway build ./my-crate --no-dry-run
+
+# After a rebuild+install+reload, confirm a daemon picked up the new binary
+headway verify wm-brain
+
+# Compose build → install/reload → verify into one receipt
+headway run ./my-crate wm-brain --unit wm-brain.service
+```
+
+Dry-run is the default posture for `build`: it prints a `BuildPlan` and the `cloudbuild.sh build <name>` line it would run, then exits 0 without touching anything.
+
+## Subcommands
+
+| Command | What it does |
+|---|---|
+| `build <crate-dir>` | Routes the build through `cloudbuild.sh`, returns a `BuildVerdict`. Dry-run by default; `--no-dry-run` applies. Skips as `no-op-fresh` when the installed version already matches source HEAD, unless `--no-require-fresh`. |
+| `verify <daemon>` | Re-queries `binstale` after a rebuild and maps the result: `fresh → confirmed`, `behind-head → contradicted`, `unknown → inconclusive`. Records `pid_before`/`pid_after` so you can confirm the daemon actually bounced. Exit 0/1/2. |
+| `run <crate-dir> <daemon>` | Composes build → install/reload → verify into one `RunReceipt`. `--unit <svc>` restarts a systemd user unit after install. |
+
+## Behavior worth knowing
+
+- **Never builds local.** If `cloudbuild.sh` is absent or returns the unreachable code, `build` reports `status: cloudbuild-unreachable`, writes a structured error to stderr, and exits non-zero. It does not fall back to a local build.
+- **Freshness guard.** A build against an already-fresh crate is a `no-op-fresh` and skips cloudbuild entirely — the same `--require-fresh` precedent as the agorabus reload path.
+- **Honest verdicts.** A `contradicted` verify outcome is never silently swallowed.
+
+## Where it fits
+
+The foundation crate of the `headway` family and the build primitive for the wider fleet: `cloudbuild` does the remote compile, `binstale` reports whether a running daemon is behind HEAD, and `headway` ties build, reload, and verify into one receipt.
+
+## Status
+
+Three subcommands shipped — `build` (v0.1.0), `verify` and `run` (v0.2.0). Each acceptance criterion has a matching integration test under `tests/`; cloudbuild and binstale are stubbed in tests via `HEADWAY_CLOUDBUILD` and `HEADWAY_BINSTALE`.
 
 ## License
 
